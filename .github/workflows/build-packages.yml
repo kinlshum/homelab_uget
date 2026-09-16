@@ -1,0 +1,53 @@
+name: Build Unraid packages
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 8 * * *'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - 'profiles/**'
+      - 'uget'
+      - '.github/workflows/build-packages.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: package-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential jq libncurses-dev xz-utils
+      - name: Build and test packages
+        run: ./scripts/build-all.bash
+      - name: Record build environment
+        run: |
+          uname -a
+          docker version
+          sha256sum dist/*.txz
+      - name: Publish stable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view packages >/dev/null 2>&1 || gh release create packages --title 'uget package repository' --notes 'Automatically maintained packages for personal Unraid servers.'
+          gh release upload packages dist/*.txz --clobber
+      - name: Commit updated catalog and legacy un-get mirror
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add catalog.tsv slackware64-current
+          git diff --cached --quiet || git commit -m 'Update package repository'
+          git push
+      - uses: actions/upload-artifact@v4
+        with:
+          name: uget-packages
+          path: dist/*.txz
+          retention-days: 14

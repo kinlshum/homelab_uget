@@ -1,0 +1,5 @@
+dist/
+.cache/
+*.tmp
+.DS_Store
+

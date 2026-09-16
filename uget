@@ -1,0 +1,308 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+UGET_VERSION="0.1.0"
+DEFAULT_REPO="https://raw.githubusercontent.com/kinlshum/uget/main"
+STATE_DIR="${UGET_STATE_DIR:-/boot/custom/uget}"
+CONFIG_DIR="${UGET_CONFIG_DIR:-/boot/config/plugins/uget}"
+CACHE_DIR="${UGET_CACHE_DIR:-/tmp/uget}"
+PACKAGE_DIR="$STATE_DIR/packages"
+CATALOG="$CACHE_DIR/catalog.tsv"
+INSTALLED="$STATE_DIR/installed.tsv"
+CONFIG_FILE="$CONFIG_DIR/uget.conf"
+
+say() { printf '[uget] %s\n' "$*"; }
+die() { printf '[uget] ERROR: %s\n' "$*" >&2; exit 1; }
+need_root() { [ "$(id -u)" -eq 0 ] || die 'This command must run as root.'; }
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"; }
+
+init_dirs() {
+  mkdir -p "$STATE_DIR" "$CONFIG_DIR" "$CACHE_DIR" "$PACKAGE_DIR"
+  touch "$INSTALLED"
+  if [ ! -f "$CONFIG_FILE" ]; then
+    printf 'UGET_REPO=%q\n' "$DEFAULT_REPO" > "$CONFIG_FILE"
+  fi
+}
+
+load_config() {
+  init_dirs
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE"
+  UGET_REPO="${UGET_REPO:-$DEFAULT_REPO}"
+}
+
+fetch() {
+  local url="$1" output="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --retry 3 --connect-timeout 15 -o "$output" "$url"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -O "$output" "$url"
+  else
+    die 'curl or wget is required.'
+  fi
+}
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    openssl dgst -sha256 "$1" | awk '{print $NF}'
+  fi
+}
+
+require_catalog() {
+  [ -s "$CATALOG" ] || command_update
+}
+
+catalog_rows() { grep -vE '^[[:space:]]*(#|$)' "$CATALOG"; }
+
+latest_row() {
+  local package="$1"
+  catalog_rows | awk -F '\t' -v p="$package" '$1 == p' | sort -t $'\t' -k2,2V | tail -n 1
+}
+
+installed_row() {
+  local package="$1"
+  awk -F '\t' -v p="$package" '$1 == p' "$INSTALLED" | tail -n 1
+}
+
+record_installed() {
+  local row="$1" package
+  package="${row%%$'\t'*}"
+  awk -F '\t' -v p="$package" '$1 != p' "$INSTALLED" > "$INSTALLED.tmp"
+  printf '%s\n' "$row" >> "$INSTALLED.tmp"
+  mv "$INSTALLED.tmp" "$INSTALLED"
+}
+
+try_update() {
+  load_config
+  local temp="$CATALOG.tmp"
+  say "Updating catalog from $UGET_REPO"
+  fetch "$UGET_REPO/catalog.tsv" "$temp" || { rm -f "$temp"; return 1; }
+  grep -q $'^# name\tversion\t' "$temp" || { rm -f "$temp"; return 1; }
+  mv "$temp" "$CATALOG"
+  say "Catalog updated: $(catalog_rows | wc -l | tr -d ' ') packages"
+}
+
+command_update() {
+  try_update || die 'Unable to download a valid package catalog.'
+}
+
+command_search() {
+  load_config; require_catalog
+  local query="${1:-}"
+  printf '%-18s %-20s %-10s %s\n' NAME VERSION ARCH DESCRIPTION
+  catalog_rows | awk -F '\t' -v q="$query" 'BEGIN{IGNORECASE=1} q=="" || index($0,q) {printf "%-18s %-20s %-10s %s\n",$1,$2,$3,$8}'
+}
+
+install_one() {
+  local package="$1" row name version arch build expected url filename description temp actual persistent
+  row="$(latest_row "$package")"
+  [ -n "$row" ] || die "Package not found: $package"
+  IFS=$'\t' read -r name version arch build expected url filename description <<< "$row"
+  temp="$CACHE_DIR/$filename.tmp"
+  persistent="$PACKAGE_DIR/$filename"
+  say "Downloading $name $version"
+  fetch "$url" "$temp"
+  actual="$(sha256_file "$temp")"
+  [ "$actual" = "$expected" ] || { rm -f "$temp"; die "SHA-256 mismatch for $filename"; }
+  mv "$temp" "$persistent"
+  say "Installing $filename"
+  upgradepkg --install-new "$persistent"
+  record_installed "$row"
+  say "Installed $name $version"
+}
+
+command_install() {
+  need_root; load_config; require_catalog
+  [ "$#" -gt 0 ] || die 'Usage: uget install PACKAGE...'
+  need_cmd upgradepkg
+  local package
+  for package in "$@"; do install_one "$package"; done
+}
+
+command_upgrade() {
+  need_root; load_config; require_catalog
+  local packages=() row package old new
+  if [ "$#" -gt 0 ]; then
+    packages=("$@")
+  else
+    while IFS=$'\t' read -r package _; do [ -n "$package" ] && packages+=("$package"); done < "$INSTALLED"
+  fi
+  for package in "${packages[@]}"; do
+    row="$(installed_row "$package")"
+    [ -n "$row" ] || { say "$package is not managed by uget; skipping"; continue; }
+    old="$(printf '%s' "$row" | cut -f2)"
+    new="$(latest_row "$package" | cut -f2)"
+    [ -n "$new" ] || { say "$package is no longer in the catalog; keeping $old"; continue; }
+    if [ "$old" = "$new" ]; then say "$package $old is current"; else install_one "$package"; fi
+  done
+}
+
+command_remove() {
+  need_root; load_config
+  [ "$#" -gt 0 ] || die 'Usage: uget remove PACKAGE...'
+  local answer package row filename installed_pkg
+  printf 'Remove uget package(s): %s? [y/N] ' "$*"
+  read -r answer
+  case "$answer" in y|Y|yes|YES) ;; *) say 'Cancelled'; return 0;; esac
+  for package in "$@"; do
+    row="$(installed_row "$package")"
+    [ -n "$row" ] || { say "$package is not managed by uget; skipping"; continue; }
+    filename="$(printf '%s' "$row" | cut -f7)"
+    installed_pkg="$(ls /var/log/packages/ 2>/dev/null | grep -E "^${package}-[0-9]" | sort -V | tail -n1 || true)"
+    [ -z "$installed_pkg" ] || removepkg "$installed_pkg"
+    rm -f "$PACKAGE_DIR/$filename"
+    awk -F '\t' -v p="$package" '$1 != p' "$INSTALLED" > "$INSTALLED.tmp"
+    mv "$INSTALLED.tmp" "$INSTALLED"
+    say "Removed $package"
+  done
+}
+
+command_list() {
+  load_config
+  if [ ! -s "$INSTALLED" ]; then say 'No uget-managed packages.'; return; fi
+  printf '%-18s %-20s %-10s %s\n' NAME VERSION ARCH FILE
+  awk -F '\t' '{printf "%-18s %-20s %-10s %s\n",$1,$2,$3,$7}' "$INSTALLED"
+}
+
+command_verify() {
+  load_config
+  local failures=0 row expected filename actual
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    expected="$(printf '%s' "$row" | cut -f5)"
+    filename="$(printf '%s' "$row" | cut -f7)"
+    if [ ! -f "$PACKAGE_DIR/$filename" ]; then say "MISSING $filename"; failures=$((failures+1)); continue; fi
+    actual="$(sha256_file "$PACKAGE_DIR/$filename")"
+    if [ "$actual" = "$expected" ]; then say "OK $filename"; else say "FAILED $filename"; failures=$((failures+1)); fi
+  done < "$INSTALLED"
+  [ "$failures" -eq 0 ] || die "$failures package verification failure(s)."
+}
+
+command_restore() {
+  need_root; load_config; need_cmd upgradepkg
+  ln -sfn "$STATE_DIR/bin/uget" /usr/local/sbin/uget 2>/dev/null || true
+  local row expected filename actual
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    expected="$(printf '%s' "$row" | cut -f5)"
+    filename="$(printf '%s' "$row" | cut -f7)"
+    [ -f "$PACKAGE_DIR/$filename" ] || { say "Skipping missing $filename"; continue; }
+    actual="$(sha256_file "$PACKAGE_DIR/$filename")"
+    [ "$actual" = "$expected" ] || { say "Skipping corrupt $filename"; continue; }
+    upgradepkg --install-new "$PACKAGE_DIR/$filename"
+  done < "$INSTALLED"
+}
+
+profile_packages() {
+  local profile="$1" file="$CACHE_DIR/profile-$profile.txt"
+  fetch "$UGET_REPO/profiles/$profile.txt" "$file"
+  grep -vE '^[[:space:]]*(#|$)' "$file"
+}
+
+command_profile() {
+  need_root; load_config; require_catalog
+  local profile="${1:-}" packages=() package
+  [ -n "$profile" ] || die 'Usage: uget profile kraken|unraid|unmini'
+  case "$profile" in kraken|unraid|unmini) ;; *) die "Unknown profile: $profile";; esac
+  while IFS= read -r package; do packages+=("$package"); done < <({ profile_packages common; profile_packages "$profile"; } | awk '!seen[$0]++')
+  grep -v '^UGET_PROFILE=' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" || true
+  printf 'UGET_PROFILE=%q\n' "$profile" >> "$CONFIG_FILE.tmp"
+  mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+  for package in "${packages[@]}"; do
+    if [ -n "$(installed_row "$package")" ]; then
+      command_upgrade "$package"
+    else
+      install_one "$package"
+    fi
+  done
+  say "Saved boot profile: $profile"
+}
+
+command_boot_sync() {
+  need_root; load_config
+  local attempt updated=0 package
+  for attempt in 1 2 3 4 5; do
+    if try_update; then updated=1; break; fi
+    say "Network/catalog unavailable (attempt $attempt/5); retrying in 15 seconds"
+    sleep 15
+  done
+  if [ "$updated" -eq 1 ]; then
+    command_upgrade
+    if [ -n "${UGET_PROFILE:-}" ]; then
+      while IFS= read -r package; do
+        [ -n "$(installed_row "$package")" ] || install_one "$package"
+      done < <({ profile_packages common; profile_packages "$UGET_PROFILE"; } | awk '!seen[$0]++')
+    fi
+  else
+    say 'GitHub is unavailable; restoring the last verified cached packages.'
+  fi
+  command_restore
+}
+
+command_bootstrap() {
+  need_root; load_config
+  mkdir -p "$STATE_DIR/bin"
+  cp "$0" "$STATE_DIR/bin/uget"
+  chmod 755 "$STATE_DIR/bin/uget"
+  ln -sfn "$STATE_DIR/bin/uget" /usr/local/sbin/uget
+  local go_file="/boot/config/go" begin='# BEGIN UGET MANAGED BLOCK' end='# END UGET MANAGED BLOCK'
+  touch "$go_file"
+  if ! grep -Fq "$begin" "$go_file"; then
+    {
+      printf '\n%s\n' "$begin"
+      printf 'ln -sfn /boot/custom/uget/bin/uget /usr/local/sbin/uget\n'
+      printf '( sleep 30; /boot/custom/uget/bin/uget boot-sync >>/var/log/uget-boot.log 2>&1 ) &\n'
+      printf '%s\n' "$end"
+    } >> "$go_file"
+  fi
+  say 'Persistent client and boot restore hook installed.'
+}
+
+command_doctor() {
+  load_config
+  say "uget $UGET_VERSION"
+  say "Repository: $UGET_REPO"
+  say "Persistent state: $STATE_DIR"
+  local tool path
+  for tool in ffmpeg btop nmon; do
+    path="$(command -v "$tool" 2>/dev/null || true)"
+    [ -z "$path" ] || say "$tool resolves to $path"
+  done
+  [ -x /home/linuxbrew/.linuxbrew/bin/ffmpeg ] && say 'WARNING: Homebrew ffmpeg exists; keep it unlinked after ffmpeg-btbn is validated.'
+  command -v upgradepkg >/dev/null 2>&1 || say 'ERROR: upgradepkg is unavailable.'
+}
+
+command_unget_source() {
+  load_config
+  local line="$UGET_REPO/slackware64-current uget" file='/boot/config/plugins/un-get/sources.list'
+  if [ "${1:-}" = '--add' ]; then
+    need_root; mkdir -p "${file%/*}"; touch "$file"
+    grep -Fqx "$line" "$file" || printf '%s\n' "$line" >> "$file"
+    say "Added legacy un-get source: $line"
+  else
+    printf '%s\n' "$line"
+  fi
+}
+
+usage() {
+  sed -n '/^`uget` is/,/^```$/p' "${BASH_SOURCE[0]%/*}/README.md" 2>/dev/null || cat <<EOF
+uget $UGET_VERSION
+Usage: uget update|search|install|upgrade|remove|list|profile|restore|boot-sync|verify|doctor|bootstrap|unget-source
+EOF
+}
+
+main() {
+  local command="${1:-help}"; [ "$#" -eq 0 ] || shift
+  case "$command" in
+    update) command_update "$@";; search) command_search "$@";; install) command_install "$@";;
+    upgrade) command_upgrade "$@";; remove) command_remove "$@";; list) command_list "$@";;
+    profile) command_profile "$@";; restore) command_restore "$@";; boot-sync) command_boot_sync "$@";; verify) command_verify "$@";;
+    doctor) command_doctor "$@";; bootstrap) command_bootstrap "$@";;
+    unget-source) command_unget_source "$@";; help|-h|--help) usage;;
+    version|-V|--version) printf 'uget %s\n' "$UGET_VERSION";; *) die "Unknown command: $command";;
+  esac
+}
+
+main "$@"
