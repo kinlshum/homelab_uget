@@ -2,18 +2,18 @@
 set -Eeuo pipefail
 . "$(dirname "$0")/libbuild.bash"
 
-version="16p"
-source_file="$CACHE/lmon${version}.c"
+version="16s"
+archive="$CACHE/nmon${version}_binaries.tar.gz"
 stage="$CACHE/stage-nmon"
 package="$DIST/nmon-$version-$ARCH-$BUILD.txz"
 rm -rf "$stage"; mkdir -p "$stage/usr/bin" "$stage/install"
-download "https://downloads.sourceforge.net/project/nmon/lmon${version}.c" "$source_file"
-command -v docker >/dev/null 2>&1 || { echo 'Docker is required to build static nmon.' >&2; exit 1; }
-docker run --rm -v "$ROOT:/work" -w /work alpine:3.20 sh -ec '
-  apk add --no-cache build-base ncurses-dev ncurses-static >/dev/null
-  gcc -O2 -Wall -D JFS -D GETUSER -static -o .cache/stage-nmon/usr/bin/nmon .cache/lmon16p.c -lncursesw -ltinfo -lm
-  strip .cache/stage-nmon/usr/bin/nmon
-'
-printf '%s\n' 'nmon: Linux performance monitor built from official SourceForge source' > "$stage/install/slack-desc"
+download "https://downloads.sourceforge.net/project/nmon/nmon${version}_binaries.tar.gz" "$archive"
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+tar -xzf "$archive" -C "$tmp"
+# The CentOS 7 build targets Linux 2.6.32 and only GLIBC 2.7, making it the
+# broadest official x86_64 binary for current and older Unraid installations.
+install -m 755 "$tmp/nmon_X86_CentOS7_${version}" "$stage/usr/bin/nmon"
+strip "$stage/usr/bin/nmon" || true
+printf '%s\n' 'nmon: official nmon 16s x86_64 compatibility binary' > "$stage/install/slack-desc"
 make_slack_package "$stage" "$package"
-write_metadata nmon "$version" "$package" 'Linux performance monitor'
+write_metadata nmon "$version" "$package" 'Linux performance monitor (official compatibility build)'

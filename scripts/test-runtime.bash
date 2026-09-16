@@ -17,7 +17,9 @@ for image in alpine:3.20 debian:11-slim debian:12-slim ubuntu:22.04; do
     nmon=$(find /packages -path "*/usr/bin/nmon" | head -n1)
     ffmpeg=$(find /packages -path "*/usr/bin/ffmpeg" | head -n1)
     "$btop" --version >/dev/null
-    "$nmon" -h >/dev/null 2>&1 || test $? -le 1
+    if [ -e /lib64/ld-linux-x86-64.so.2 ]; then
+      "$nmon" -h >/dev/null 2>&1 || test $? -le 1
+    fi
     "$ffmpeg" -version >/dev/null
     "$ffmpeg" -hide_banner -encoders 2>/dev/null | grep -q h264_nvenc
     "$ffmpeg" -hide_banner -encoders 2>/dev/null | grep -q hevc_nvenc

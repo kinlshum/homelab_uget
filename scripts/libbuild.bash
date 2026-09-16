@@ -14,7 +14,8 @@ make_slack_package() {
   local stage="$1" output="$2"
   mkdir -p "$stage/install"
   [ -f "$stage/install/slack-desc" ] || printf '%s\n' 'uget: package built by uget' > "$stage/install/slack-desc"
-  tar --numeric-owner --owner=0 --group=0 -C "$stage" -cJf "$output" .
+  find "$stage" -exec touch -h -d '@0' {} +
+  tar --sort=name --mtime='@0' --numeric-owner --owner=0 --group=0 -C "$stage" -cJf "$output" .
 }
 
 write_metadata() {
@@ -24,4 +25,3 @@ write_metadata() {
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$name" "$version" "$ARCH" "$BUILD" "$sha" "$url" "$(basename "$package")" "$description" > "$package.meta"
 }
-
