@@ -11,11 +11,12 @@ download "https://downloads.sourceforge.net/project/nmon/lmon${version}.c" "$sou
 command -v docker >/dev/null 2>&1 || { echo 'Docker is required to build nmon.' >&2; exit 1; }
 # Build in an older glibc userspace and statically link ncurses. This avoids
 # inheriting the current GitHub runner's newer ABI or Unraid ncurses revisions.
-docker run --rm -v "$ROOT:/work" -w /work debian:12-slim sh -ec '
+docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -v "$ROOT:/work" -w /work debian:12-slim sh -ec '
   apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential libncurses-dev >/dev/null
   gcc -O2 -Wall -D JFS -D GETUSER -static -o .cache/stage-nmon/usr/bin/nmon .cache/lmon16s.c -lncursesw -ltinfo -lm -ldl -lpthread
   strip .cache/stage-nmon/usr/bin/nmon
+  chown "$HOST_UID:$HOST_GID" .cache/stage-nmon/usr/bin/nmon
 '
 printf '%s\n' 'nmon: nmon 16s built as a static x86_64 compatibility binary' > "$stage/install/slack-desc"
 make_slack_package "$stage" "$package"
